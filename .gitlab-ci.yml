@@ -1,0 +1,42 @@
+stages:
+  - terraform-plan
+  - terraform-apply
+  - terraform-destroy
+
+# --- Terraform Plan (Feature Branches) ---
+terraform-plan:
+  stage: terraform-plan
+  tags:
+    - aws-org
+  script:
+    - terraform init
+    - terraform plan -out=tfplan
+  artifacts:
+    paths:
+      - tfplan
+      - lambda/*.zip
+    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+      changes:
+        - "*.tf"
+        - "lambda/**/*"
+        - "*.yml"
+
+# --- Terraform Apply (Main Branch) ---
+terraform-apply:
+  stage: terraform-apply
+  tags:
+    - aws-org
+  needs:
+    - job: terraform-plan
+      artifacts: true
+  script:
+    - terraform init
+    - terraform apply tfplan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - "*.tf"
+        - "lambda/**/*"
+        - "*.yml"
