@@ -1,0 +1,157 @@
+stages:
+  - validate
+  - deploy
+
+variables:
+  # AWS Account Configuration
+  AWS_DEFAULT_REGION: eu-west-1
+  TARGET_ACCOUNT_ID: "123456789012"
+  ASSUME_ROLE_ARN: "arn:aws:iam::123456789012:role/AWSAFTExecution"
+  EXTERNAL_ID: "ASSUME_ROLE_ON_TARGET_ACC"
+  
+  # Stack Configuration
+  STACK_NAME: ct-config-recorder-customization
+  TEMPLATE_FILE: ct-config-recorder-customization.yml
+
+validate:
+  stage: validate
+  tags:
+    - test-org
+  script:
+    - aws cloudformation validate-template --template-body file://$TEMPLATE_FILE
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"
+      changes:
+        - "*.yml"
+
+deploy:
+  stage: deploy
+  tags:
+    - test-org
+  script:
+    # Assume role
+    - |
+      echo "Assuming role $ASSUME_ROLE_ARN in account $TARGET_ACCOUNT_ID..."
+      CREDS=$(aws sts assume-role \
+        --role-arn $ASSUME_ROLE_ARN \
+        --role-session-name gitlab-ci-$(date +%s) \
+        --external-id $EXTERNAL_ID \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text \
+        --region $AWS_DEFAULT_REGION)
+      
+      if [ $? -ne 0 ] || [ -z "$CREDS" ]; then
+        echo "ERROR: Failed to assume role $ASSUME_ROLE_ARN"
+        exit 1
+      fi
+      
+      export AWS_ACCESS_KEY_ID=$(echo $CREDS | cut -d' ' -f1)
+      export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | cut -d' ' -f2)
+      export AWS_SESSION_TOKEN=$(echo $CREDS | cut -d' ' -f3)
+      echo "Successfully assumed role"
+    
+    # Deploy stack
+    - |
+      echo "Checking if stack $STACK_NAME exists in region $AWS_DEFAULT_REGION..."
+      if aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_DEFAULT_REGION >/dev/null 2>&1; then
+        echo "Stack exists. Using change set for update..."
+        
+        CHANGE_SET_NAME="changeset-$(date +%s)"
+        echo "Creating change set: $CHANGE_SET_NAME"
+        
+        # Create change set for update
+        aws cloudformation create-change-set \
+          --stack-name $STACK_NAME \
+          --template-body file://$TEMPLATE_FILE \
+          --change-set-name $CHANGE_SET_NAME \
+          --change-set-type UPDATE \
+          --capabilities CAPABILITY_IAM \
+          --region $AWS_DEFAULT_REGION
+        
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to create change set"
+          exit 1
+        fi
+        
+        # Wait a moment for change set to be processed, then check status
+        echo "Waiting for change set to be processed..."
+        sleep 10
+        
+        # Check change set status
+        CHANGE_SET_STATUS=$(aws cloudformation describe-change-set \
+          --stack-name $STACK_NAME \
+          --change-set-name $CHANGE_SET_NAME \
+          --region $AWS_DEFAULT_REGION \
+          --query 'Status' \
+          --output text)
+        
+        echo "Change set status: $CHANGE_SET_STATUS"
+        
+        if [ "$CHANGE_SET_STATUS" = "FAILED" ]; then
+          # Get the reason for failure
+          FAILURE_REASON=$(aws cloudformation describe-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME \
+            --region $AWS_DEFAULT_REGION \
+            --query 'StatusReason' \
+            --output text)
+          
+          echo "Change set failed: $FAILURE_REASON"
+          
+          # Clean up failed change set
+          aws cloudformation delete-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME \
+            --region $AWS_DEFAULT_REGION
+          
+          # Check if it's a "no updates" scenario
+          if echo "$FAILURE_REASON" | grep -q "didn't contain changes" || echo "$FAILURE_REASON" | grep -q "No updates are to be performed"; then
+            echo "No changes detected in the template. Stack is already up to date."
+            exit 0
+          else
+            echo "Change set failed for other reasons. Exiting with error."
+            exit 1
+          fi
+        fi
+        
+        # Execute change set if it's ready
+        if [ "$CHANGE_SET_STATUS" = "CREATE_COMPLETE" ]; then
+          echo "Executing change set..."
+          aws cloudformation execute-change-set \
+            --stack-name $STACK_NAME \
+            --change-set-name $CHANGE_SET_NAME \
+            --region $AWS_DEFAULT_REGION
+          
+          # Wait for stack update to complete
+          echo "Waiting for stack update to complete..."
+          aws cloudformation wait stack-update-complete --stack-name $STACK_NAME --region $AWS_DEFAULT_REGION
+          echo "Stack update completed successfully"
+        else
+          echo "Change set is not ready for execution. Status: $CHANGE_SET_STATUS"
+          exit 1
+        fi
+        
+      else
+        echo "Stack does not exist. Creating new stack..."
+        
+        # Create stack directly
+        aws cloudformation create-stack \
+          --stack-name $STACK_NAME \
+          --template-body file://$TEMPLATE_FILE \
+          --capabilities CAPABILITY_IAM \
+          --region $AWS_DEFAULT_REGION
+        
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to create stack"
+          exit 1
+        fi
+        
+        # Wait for stack creation to complete
+        echo "Waiting for stack creation to complete..."
+        aws cloudformation wait stack-create-complete --stack-name $STACK_NAME --region $AWS_DEFAULT_REGION
+        echo "Stack creation completed successfully"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - "*.yml"

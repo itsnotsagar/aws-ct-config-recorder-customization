@@ -1,158 +1,135 @@
-# AWS Control Tower Config Recorder Customization
+# AWS Control Tower Config Recorder Customization (Terraform)
 
-Automatically optimizes AWS Config recorder settings for landing zones managed by **AWS Control Tower** and **Account Factory for Terraform (AFT)** to reduce costs while maintaining compliance visibility.
+> Tip: To force a full re-run across all Control Tower managed accounts, bump `lambda_version` in `variables.tf` (e.g., "1" → "2") and run `terraform apply`. This updates the Producer Lambda config and re-processes all accounts via EventBridge/CloudTrail.
 
-## Overview
+This Terraform solution customizes AWS Config Recorder settings across all AWS Control Tower managed accounts using an event-driven, serverless pattern. It applies region-aware defaults, records critical resources continuously, excludes noisy types, and uses daily recording where appropriate to reduce cost while maintaining useful visibility.
 
-**Control Tower Default Behavior:**
-AWS Control Tower creates Config recorders that record **all supported resources continuously** across all managed accounts and regions (except IAM global resources which are recorded only in the home region). This default configuration can result in high AWS Config costs, especially for environments with frequent resource changes.
+## What it does
 
-**This Solution:**
-This CloudFormation template automatically overrides Control Tower's default Config recorder settings with cost-optimized configurations. It deploys Lambda functions that detect Control Tower account creation/update events and reconfigure Config recorders to use:
+- Listens to Control Tower lifecycle events (CreateManagedAccount, UpdateManagedAccount, UpdateLandingZone)
+- Fans out account/region work items via SQS
+- Assumes `AWSControlTowerExecution` role in target accounts and updates their Config Recorder
+- Uses region-specific mappings from `locals.tf` for continuous recording and exclusions
 
-**Cost Optimization Features:**
-- **Daily recording frequency** instead of continuous recording (significantly reduces configuration item charges)
-- **Exclusion-based recording** to skip expensive, high-change resources like backup recovery points and compliance data
-- **Selective continuous recording** only for critical resources that require real-time monitoring (IAM, Route53, etc.)
-- **Region-specific resource mappings** that can be customized by modifying the template mappings
-- **Automatic application** to new accounts created through Control Tower or AFT
+## Architecture (at a glance)
 
-## Architecture
+- Event sources: EventBridge rules for Control Tower and Lambda update events
+- Orchestrator: Producer Lambda (`ct-config-recorder-producer`)
+- Queue: SQS (`ct-config-recorder-queue`)
+- Worker: Consumer Lambda (`ct-config-recorder-consumer`)
 
-- **Producer Lambda**: Detects Control Tower events and queues processing tasks
-- **Consumer Lambda**: Assumes the `AWSControlTowerExecution` role in target accounts to override Config recorder settings
-- **SQS Queue**: Manages processing queue between producer and consumer
-- **EventBridge Rule**: Triggers on Control Tower events (CreateManagedAccount, UpdateManagedAccount, UpdateLandingZone)
+Key runtime settings (as defined in Terraform):
+- Producer: python3.12, memory 512 MB, timeout 900s, reserved concurrency 1
+- Consumer: python3.12, memory 512 MB, timeout 900s, reserved concurrency 50
+- SQS: visibility timeout 900s, delay 5s, KMS alias `alias/aws/sqs`
 
-**Cross-Account Access:**
-The Consumer Lambda uses the `AWSControlTowerExecution` role (automatically created by Control Tower in all managed accounts) to gain the necessary permissions to modify Config recorder settings across the organization.
+## Prerequisites
 
-## How It Works
+- AWS Control Tower is set up and managing your accounts
+- Permissions to deploy in the Control Tower management account
+- Terraform 1.x and AWS provider >= 5.84.0
+- AWS credentials for the management account (SSO or access keys). The Consumer assumes `AWSControlTowerExecution` in target accounts.
 
-### Initial Deployment
-When the CloudFormation stack is **first deployed**, the Producer Lambda is automatically triggered via a custom resource and will:
-1. Query all existing Control Tower managed accounts across all regions
-2. Send messages to the SQS queue for each account/region combination
-3. The Consumer Lambda processes these messages and overrides **all existing Config recorders** managed by Control Tower
+Backend note: `providers.tf` configures an S3 backend. Update `bucket`, `key`, and `region` for your environment before running Terraform. If you prefer local state, switch the backend accordingly.
 
-### Ongoing Operations
-After initial deployment, the system operates automatically based on Control Tower events:
+## Inputs (variables.tf)
 
-**Event Triggers:**
-- **`CreateManagedAccount`**: When Control Tower creates a new account (including AFT provisioned accounts)
-- **`UpdateManagedAccount`**: When Control Tower updates an existing managed account
-- **`UpdateLandingZone`**: When Control Tower landing zone is updated (affects all accounts)
+- `excluded_accounts` (list(string), default placeholders): Account IDs to skip (typically management, audit, log archive). Must be 12-digit strings.
+- `lambda_log_level` (string, default `INFO`): One of `DEBUG|INFO|WARNING|ERROR`.
+- `config_recorder_strategy` (string, default `EXCLUSION`): Currently only `EXCLUSION` is supported.
+- `config_recorder_default_recording_frequency` (string, default `DAILY`): Currently only `DAILY`.
+- `aws_region` (string, default `eu-west-1`): Deployment and target region for providers.
+- `account_id` (string): Account to assume with the provider alias `target` (defaults to a placeholder). Provider assumes role `AWSAFTExecution` with an external ID.
+- `lambda_version` (string, default `1`): Increment to force a manual re-run.
 
-**Workflow:**
-1. **EventBridge Rule** detects Control Tower events and triggers the Producer Lambda
-2. **Producer Lambda** identifies the target account(s) and region(s) based on the event type
-3. **Producer Lambda** sends messages to the SQS queue with account/region details
-4. **Consumer Lambda** is triggered by SQS messages and assumes the `AWSControlTowerExecution` role in each target account
-5. **Consumer Lambda** overrides the Config recorder settings with the cost-optimized configuration
+Region mappings (locals.tf):
+- `region_continuous_resources`: resource types that should be `CONTINUOUS`
+- `region_exclusions`: resource types to exclude entirely
 
-## Parameters
+These are exported to the Consumer Lambda via env vars `REGION_RESOURCE_TYPES_MAPPING` and `REGION_EXCLUSIONS_MAPPING`.
 
-| Parameter | Description | Default | Values |
-|-----------|-------------|---------|---------|
-| `CloudFormationVersion` | Version to force stack updates | `1` | Any string |
-| `ExcludedAccounts` | Accounts to skip | Management, Audit, Log Archive | Account ID list |
-| `ConfigRecorderStrategy` | Recording strategy | `EXCLUSION` | `EXCLUSION` |
-| `ConfigRecorderDefaultRecordingFrequency` | Default frequency | `DAILY` | `DAILY` |
+## Deploy
 
-## Region Mappings
+1) Configure backend and providers
+- Edit `providers.tf` backend `bucket`, `key`, `region`
+- Adjust `aws_region`/`account_id` in `variables.tf` or via `-var`/
+  tfvars
 
-### RegionResourceTypes
-Resources recorded **continuously** instead of daily:
-- **us-east-1**: IAM, Route53, WAF, CloudFront, ECR Public
-- **us-west-2, ap-south-1, ap-northeast-2, eu-west-1**: EC2, VPC, ELB resources
-
-### RegionExclusions  
-Resources **excluded** from recording:
-- **us-east-1**: Config compliance, Backup recovery points, Global Accelerator
-- **Other regions**: Above + IAM, Route53, WAF, CloudFront, ECR Public, Global Accelerator
-
-## Recording Strategy
-
-- **EXCLUSION**: Records all resources except those in RegionExclusions
-- RegionResourceTypes resources are recorded continuously instead of daily
-
-## Deployment
-
-### Option 1: AWS CLI
-
+2) Initialize and apply
 ```bash
-aws cloudformation create-stack \
-  --stack-name ct-config-recorder-customization \
-  --template-body file://ct-config-recorder-customization.yml \
-  --parameters ParameterKey=ExcludedAccounts,ParameterValue="['123456789012','234567890123']" \
-  --capabilities CAPABILITY_IAM
+terraform init
+terraform plan
+terraform apply
 ```
 
-Replace the account IDs with your management, audit, and log archive accounts.
+3) First run behavior
+- An `aws_lambda_invocation` resource triggers the Producer once after deploy to enqueue work for all accounts.
 
-### Option 2: AWS Console (Manual)
+## Manual triggers
 
-1. **Navigate to CloudFormation Console**
-   - Go to AWS CloudFormation in your Control Tower home region
-   - Click "Create stack" → "With new resources (standard)"
-
-2. **Upload Template**
-   - Select "Upload a template file"
-   - Choose the `ct-config-recorder-customization.yml` file
-   - Click "Next"
-
-3. **Configure Stack Parameters**
-   - **Stack name**: `ct-config-recorder-customization`
-   - **CloudFormationVersion**: Leave as `1` (increment for updates)
-   - **ExcludedAccounts**: Enter your account IDs as a list, e.g., `['123456789012','234567890123']`
-   - **ConfigRecorderStrategy**: `EXCLUSION` (only option)
-   - **ConfigRecorderDefaultRecordingFrequency**: `DAILY` (only option)
-   - Click "Next"
-
-4. **Configure Stack Options**
-   - Add tags if desired (optional)
-   - Leave other settings as default
-   - Click "Next"
-
-5. **Review and Deploy**
-   - Review all settings
-   - Check "I acknowledge that AWS CloudFormation might create IAM resources"
-   - Click "Submit"
-
-The stack will create Lambda functions, SQS queue, EventBridge rules, and IAM roles needed for automatic Config recorder customization.
-
-## Customization
-
-### Add Resources for Continuous Recording
-```yaml
-RegionResourceTypes:
-  us-east-1:
-    ResourceTypes:
-      - AWS::IAM::User
-      - AWS::RDS::DBInstance  # Add this
-```
-
-### Add Resources to Exclude
-```yaml
-RegionExclusions:
-  us-east-1:
-    ResourceTypes:
-      - AWS::Config::ResourceCompliance
-      - AWS::S3::Bucket  # Add this
-```
-
-### Add New Region
-Add the region to both mappings and update the Consumer Lambda environment variables.
+- Bump `lambda_version` in `variables.tf` and `terraform apply` (recommended)
+- Update the Producer Lambda configuration in any way that results in a config update event
+- Directly invoke the Producer for ad-hoc tests (optional)
 
 ## Monitoring
 
-Check CloudWatch logs:
-- Producer Lambda: `/aws/lambda/ct-config-recorder-customization-ProducerLambda-{RandomString}`
-- Consumer Lambda: `/aws/lambda/ct-config-recorder-customization-ConsumerLambda-{RandomString}`
+- Logs: `/aws/lambda/ct-config-recorder-producer`, `/aws/lambda/ct-config-recorder-consumer` (retention 90 days)
+- Look for Producer messages like "Message sent to SQS" and for Consumer messages referencing `put_configuration_recorder`
 
-Note: Replace `{RandomString}` with the actual suffix generated by CloudFormation, or find the exact names in the Lambda console.
+## Troubleshooting
+
+- Producer isn’t firing: Verify EventBridge rules exist and CloudTrail is enabled in the management account
+- Messages aren’t processed: Check SQS metrics and Consumer Lambda concurrency; verify excluded accounts list
+- AssumeRole failures: Ensure `AWSControlTowerExecution` exists and the management account has permission to assume it
+- Not seeing updates: Confirm your target region is in `locals.tf` mappings, and verify the resource lists
+
+Enable more logs by setting `lambda_log_level = "DEBUG"` and re-applying.
+
+## Security and cost considerations
+
+- IAM: Minimal policies for Lambda + SQS; Consumer allows `sts:AssumeRole` and expects `AWSControlTowerExecution` in each account
+- SQS: Encrypted with AWS-managed KMS key
+- Strategy: `EXCLUSION_BY_RESOURCE_TYPES` with `DAILY` default and regional `CONTINUOUS` overrides for critical types
+
+Note: Cost impact depends on your footprint and change rates. This module focuses on reducing noise and avoiding duplicate global resource recording across regions.
+
+## Customize behavior
+
+Edit `locals.tf` to adjust per-region lists:
+- Add resource types to `region_continuous_resources` to record them continuously
+- Add resource types to `region_exclusions` to exclude them entirely
+
+Changes are picked up by the Consumer via environment variables on the next deploy.
+
+## CI/CD (optional)
+
+The included `.gitlab-ci.yml` provides simple plan/apply stages. Ensure a suitable runner (`tags: [aws-org]`) and AWS credentials are available to the runner, and that your backend is reachable.
+
+## Cleanup
+
+If you deployed only this module in a dedicated workspace:
+```bash
+terraform destroy
+```
+
+## Project layout
+
+```
+aws-tf-ct-config-recorder-customization/
+├── main.tf           # SQS, Lambdas, IAM, EventBridge, log groups
+├── providers.tf      # Required providers and backend config
+├── variables.tf      # Inputs (log level, region, exclusions, etc.)
+├── locals.tf         # Region mappings and common tags
+├── lambda/
+│   ├── producer/index.py  # Producer Lambda
+│   └── consumer/index.py  # Consumer Lambda
+└── cloudformation-deployment/
+    ├── ct-config-recorder-customization.yml  # Reference CFN implementation
+    └── README.md                             # CFN deployment guide
+```
 
 ## References
 
-This solution is derived from the AWS blog post: [Customize AWS Config resource tracking in AWS Control Tower environment](https://aws.amazon.com/blogs/mt/customize-aws-config-resource-tracking-in-aws-control-tower-environment/)
-
+- AWS Config: https://docs.aws.amazon.com/config/
+- AWS Control Tower: https://docs.aws.amazon.com/controltower/
+- Terraform AWS Provider: https://registry.terraform.io/providers/hashicorp/aws/

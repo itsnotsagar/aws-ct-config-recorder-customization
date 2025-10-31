@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CloudFormation Template to update config recorder settings in child accounts created by ControlTower."
+
+Mappings:
+  RegionResourceTypes:
+    us-east-1:
+      ResourceTypes:
+        - AWS::IAM::User
+        - AWS::Route53::HostedZone
+        - AWS::Route53::HealthCheck
+        - AWS::WAFv2::WebACL
+        - AWS::CloudFront::Distribution
+        - AWS::ECR::PublicRepository
+    us-west-2:
+      ResourceTypes:
+        - AWS::EC2::Instance
+        - AWS::EC2::VPC
+        - AWS::EC2::Subnet
+        - AWS::EC2::Volume
+        - AWS::EC2::NetworkInterface
+        - AWS::EC2::EIP
+        - AWS::ElasticLoadBalancing::LoadBalancer
+        - AWS::ElasticLoadBalancingV2::LoadBalancer
+    ap-south-1:
+      ResourceTypes:
+        - AWS::EC2::Instance
+        - AWS::EC2::VPC
+        - AWS::EC2::Subnet
+        - AWS::EC2::Volume
+        - AWS::EC2::NetworkInterface
+        - AWS::EC2::EIP
+        - AWS::ElasticLoadBalancing::LoadBalancer
+        - AWS::ElasticLoadBalancingV2::LoadBalancer
+    ap-northeast-2:
+      ResourceTypes:
+        - AWS::EC2::Instance
+        - AWS::EC2::VPC
+        - AWS::EC2::Subnet
+        - AWS::EC2::Volume
+        - AWS::EC2::NetworkInterface
+        - AWS::EC2::EIP
+        - AWS::ElasticLoadBalancing::LoadBalancer
+        - AWS::ElasticLoadBalancingV2::LoadBalancer
+    eu-west-1:
+      ResourceTypes:
+        - AWS::EC2::Instance
+        - AWS::EC2::VPC
+        - AWS::EC2::Subnet
+        - AWS::EC2::Volume
+        - AWS::EC2::NetworkInterface
+        - AWS::EC2::EIP
+        - AWS::ElasticLoadBalancing::LoadBalancer
+        - AWS::ElasticLoadBalancingV2::LoadBalancer
+  RegionExclusions:
+    us-east-1:
+      ResourceTypes:
+        - AWS::Config::ResourceCompliance
+        - AWS::Backup::RecoveryPoint
+        - AWS::GlobalAccelerator::Listener
+        - AWS::GlobalAccelerator::EndpointGroup
+        - AWS::GlobalAccelerator::Accelerator
+    us-west-2:
+      ResourceTypes:
+        - AWS::Backup::RecoveryPoint
+        - AWS::Config::ResourceCompliance
+        - AWS::IAM::Role
+        - AWS::IAM::Policy
+        - AWS::IAM::User
+        - AWS::IAM::Group
+        - AWS::Route53::HostedZone
+        - AWS::Route53::HealthCheck
+        - AWS::WAFv2::WebACL
+        - AWS::CloudFront::Distribution
+        - AWS::ECR::PublicRepository
+    ap-south-1:
+      ResourceTypes:
+        - AWS::Backup::RecoveryPoint
+        - AWS::Config::ResourceCompliance
+        - AWS::IAM::Role
+        - AWS::IAM::Policy
+        - AWS::IAM::User
+        - AWS::IAM::Group
+        - AWS::Route53::HostedZone
+        - AWS::Route53::HealthCheck
+        - AWS::WAFv2::WebACL
+        - AWS::CloudFront::Distribution
+        - AWS::ECR::PublicRepository
+        - AWS::GlobalAccelerator::Listener
+        - AWS::GlobalAccelerator::EndpointGroup
+        - AWS::GlobalAccelerator::Accelerator
+    ap-northeast-2:
+      ResourceTypes:
+        - AWS::Backup::RecoveryPoint
+        - AWS::Config::ResourceCompliance
+        - AWS::IAM::Role
+        - AWS::IAM::Policy
+        - AWS::IAM::User
+        - AWS::IAM::Group
+        - AWS::Route53::HostedZone
+        - AWS::Route53::HealthCheck
+        - AWS::WAFv2::WebACL
+        - AWS::CloudFront::Distribution
+        - AWS::ECR::PublicRepository
+        - AWS::GlobalAccelerator::Listener
+        - AWS::GlobalAccelerator::EndpointGroup
+        - AWS::GlobalAccelerator::Accelerator
+    eu-west-1:
+      ResourceTypes:
+        - AWS::Backup::RecoveryPoint
+        - AWS::Config::ResourceCompliance
+        - AWS::IAM::Role
+        - AWS::IAM::Policy
+        - AWS::IAM::User
+        - AWS::IAM::Group
+        - AWS::Route53::HostedZone
+        - AWS::Route53::HealthCheck
+        - AWS::WAFv2::WebACL
+        - AWS::CloudFront::Distribution
+        - AWS::ECR::PublicRepository
+        - AWS::GlobalAccelerator::Listener
+        - AWS::GlobalAccelerator::EndpointGroup
+        - AWS::GlobalAccelerator::Accelerator
+
+Parameters:
+  CloudFormationVersion:
+    Description: Update Version every time stack is updated to force rerun of the solution.
+    Type: String
+    Default: 1
+
+  ExcludedAccounts:
+    Description: Excluded Accounts list. This list should contain Management account, Log Archive and Audit accounts at the minimum and other accounts you want to be excluded.
+    Default: ""
+    Type: String
+
+  ConfigRecorderStrategy:
+    Default: EXCLUSION
+    Description: Config Recorder Strategy
+    Type: String
+    AllowedValues:
+      - EXCLUSION
+
+  ConfigRecorderDefaultRecordingFrequency:
+    Description: Default Frequency of recording configuration changes.
+    Default: DAILY
+    Type: String
+    AllowedValues:
+      - DAILY
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Mandatory Settings"
+        Parameters:
+          - CloudFormationVersion
+          - ExcludedAccounts
+      - Label:
+          default: "Recording Strategy Settings"
+        Parameters:
+          - ConfigRecorderStrategy
+      - Label:
+          default: " Recording Frequency Settings"
+        Parameters:
+          - ConfigRecorderDefaultRecordingFrequency
+
+Resources:
+  ProducerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import ast
+          import json
+          import urllib3
+          
+          # cfnresponse module implementation
+          class cfnresponse:
+              SUCCESS = "SUCCESS"
+              FAILED = "FAILED"
+              
+              @staticmethod
+              def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+                  responseUrl = event['ResponseURL']
+                  print(responseUrl)
+                  responseBody = {
+                      'Status' : responseStatus,
+                      'Reason' : reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name),
+                      'PhysicalResourceId' : physicalResourceId or context.log_stream_name,
+                      'StackId' : event['StackId'],
+                      'RequestId' : event['RequestId'],
+                      'LogicalResourceId' : event['LogicalResourceId'],
+                      'NoEcho' : noEcho,
+                      'Data' : responseData
+                  }
+                  json_responseBody = json.dumps(responseBody)
+                  print("Response body:")
+                  print(json_responseBody)
+                  headers = {
+                      'content-type' : '',
+                      'content-length' : str(len(json_responseBody))
+                  }
+                  try:
+                      http = urllib3.PoolManager()
+                      response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                      print("Status code:", response.status)
+                  except Exception as e:
+                      print("send(..) failed executing http.request(..):", e)
+          
+          def lambda_handler(event, context):
+              LOG_LEVEL = os.getenv('LOG_LEVEL')
+              logging.getLogger().setLevel(LOG_LEVEL)
+              
+              try:
+                  logging.info('Event Data: ')
+                  logging.info(event)
+                  sqs_url = os.getenv('SQS_URL')
+                  excluded_accounts = os.getenv('EXCLUDED_ACCOUNTS')
+                  logging.info(f'Excluded Accounts: {excluded_accounts}')
+                  sqs_client = boto3.client('sqs')
+                  
+                  is_eb_trigerred = 'source' in event
+                  logging.info(f'Is EventBridge Trigerred: {str(is_eb_trigerred)}')
+                  event_source = ''
+                  
+                  if is_eb_trigerred:
+                      event_source = event['source']
+                      logging.info(f'Control Tower Event Source: {event_source}')
+                      event_name = event['detail']['eventName']
+                      logging.info(f'Control Tower Event Name: {event_name}')
+                  
+                  if event_source == 'aws.controltower' and event_name == 'UpdateManagedAccount':    
+                      account = event['detail']['serviceEventDetails']['updateManagedAccountStatus']['account']['accountId']
+                      logging.info(f'overriding config recorder for SINGLE account: {account}')
+                      override_config_recorder(excluded_accounts, sqs_url, account, 'controltower')
+                  elif event_source == 'aws.controltower' and event_name == 'CreateManagedAccount':  
+                      account = event['detail']['serviceEventDetails']['createManagedAccountStatus']['account']['accountId']
+                      logging.info(f'overriding config recorder for SINGLE account: {account}')
+                      override_config_recorder(excluded_accounts, sqs_url, account, 'controltower')
+                  elif event_source == 'aws.controltower' and event_name == 'UpdateLandingZone':
+                      logging.info('overriding config recorder for ALL accounts due to UpdateLandingZone event')
+                      override_config_recorder(excluded_accounts, sqs_url, '', 'controltower')
+                  elif ('LogicalResourceId' in event) and (event['RequestType'] == 'Create'):
+                      logging.info('CREATE CREATE')
+                      logging.info('overriding config recorder for ALL accounts because of first run after function deployment from CloudFormation')
+                      override_config_recorder(excluded_accounts, sqs_url, '', 'Create')
+                      response = {}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response, "CustomResourcePhysicalID")
+                  elif ('LogicalResourceId' in event) and (event['RequestType'] == 'Update'):
+                      logging.info('Update Update')
+                      logging.info('overriding config recorder for ALL accounts because of first run after function deployment from CloudFormation')
+                      override_config_recorder(excluded_accounts, sqs_url, '', 'Update')
+                      response = {}
+                      update_excluded_accounts(excluded_accounts,sqs_url)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response, "CustomResourcePhysicalID")    
+                  elif ('LogicalResourceId' in event) and (event['RequestType'] == 'Delete'):
+                      logging.info('DELETE DELETE')
+                      logging.info('overriding config recorder for ALL accounts because of first run after function deployment from CloudFormation')
+                      override_config_recorder(excluded_accounts, sqs_url, '', 'Delete')
+                      response = {}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response, "CustomResourcePhysicalID")
+                  else:
+                      logging.info("No matching event found")
+                  
+                  logging.info('Execution Successful')
+                  return {'statusCode': 200}
+              
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}')
+          
+          def override_config_recorder(excluded_accounts, sqs_url, account, event):
+              try:
+                  client = boto3.client('cloudformation')
+                  paginator = client.get_paginator('list_stack_instances')
+                  
+                  if account == '':
+                      page_iterator = paginator.paginate(StackSetName ='AWSControlTowerBP-BASELINE-CONFIG')
+                  else:
+                      page_iterator = paginator.paginate(StackSetName ='AWSControlTowerBP-BASELINE-CONFIG', StackInstanceAccount=account)
+                      
+                  sqs_client = boto3.client('sqs')
+                  for page in page_iterator:
+                      logging.info(page)
+                      for item in page['Summaries']:
+                          account = item['Account']
+                          region = item['Region']
+                          send_message_to_sqs(event, account, region, excluded_accounts, sqs_client, sqs_url)
+                          
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}')
+          
+          def send_message_to_sqs(event, account, region, excluded_accounts, sqs_client, sqs_url):
+              try:
+                  if account not in excluded_accounts:
+                      sqs_msg = f'{{"Account": "{account}", "Region": "{region}", "Event": "{event}"}}'
+                      response = sqs_client.send_message(QueueUrl=sqs_url, MessageBody=sqs_msg)
+                      logging.info(f'message sent to sqs: {sqs_msg}')
+                  else:    
+                      logging.info(f'Account excluded: {account}')
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}') 
+                         
+          def update_excluded_accounts(excluded_accounts,sqs_url):
+              try:
+                  acctid = boto3.client('sts')
+                  new_excluded_accounts = "['" + acctid.get_caller_identity().get('Account') + "']"
+                  logging.info(f'templist: {new_excluded_accounts}')
+                  templist=ast.literal_eval(excluded_accounts)
+                  templist_out=[]
+                  for acct in templist:
+                      if acctid.get_caller_identity().get('Account') != acct:
+                          templist_out.append(acct)
+                          logging.info(f'Delete request sent: {acct}')
+                          override_config_recorder(new_excluded_accounts, sqs_url, acct, 'Delete')
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}')
+      Handler: index.lambda_handler
+      Role: !GetAtt ProducerLambdaExecutionRole.Arn
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 300
+      Architectures:
+        - x86_64
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          EXCLUDED_ACCOUNTS: !Ref ExcludedAccounts
+          LOG_LEVEL: INFO
+          SQS_URL: !Ref SQSConfigRecorder
+
+  ProducerEventTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to trigger config recorder override producer lambda"
+      EventBusName: default
+      EventPattern:
+        source:
+          - "aws.controltower"
+        detail-type:
+          - "AWS Service Event via CloudTrail"
+        detail:
+          eventName:
+            - "UpdateLandingZone"
+            - "CreateManagedAccount"
+            - "UpdateManagedAccount"
+      Name: !GetAtt SQSConfigRecorder.QueueName
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - "ProducerLambda"
+              - "Arn"
+          Id: "ProducerTarget"
+
+  ProducerLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ProducerLambda
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ProducerEventTrigger.Arn
+
+  ConsumerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import botocore.exceptions
+          import os
+          
+          def lambda_handler(event, context):
+              LOG_LEVEL = os.getenv('LOG_LEVEL')
+              logging.getLogger().setLevel(LOG_LEVEL)
+              
+              try:
+                  logging.info(f'Event: {str(event).replace(chr(10), "").replace(chr(13), "")}')
+                  
+                  body = json.loads(event['Records'][0]['body'])
+                  account_id = body['Account']
+                  aws_region = body['Region']
+                  event = body['Event']
+                  
+                  logging.info(f'Extracted Account: {str(account_id).replace(chr(10), "").replace(chr(13), "")}')
+                  logging.info(f'Extracted Region: {str(aws_region).replace(chr(10), "").replace(chr(13), "")}')
+                  logging.info(f'Extracted Event: {str(event).replace(chr(10), "").replace(chr(13), "")}')
+                  
+                  bc = botocore.__version__
+                  b3 = boto3.__version__
+                  logging.info(f'Botocore : {bc}')
+                  logging.info(f'Boto3 : {b3}')
+                  
+                  STS = boto3.client("sts")
+                  
+                  def assume_role(account_id, role='AWSControlTowerExecution'):
+                      try:
+                          curr_account = STS.get_caller_identity()['Account']
+                          if curr_account != account_id:
+                              part = STS.get_caller_identity()['Arn'].split(":")[1]
+                              role_arn = 'arn:' + part + ':iam::' + account_id + ':role/' + role
+                              ses_name = str(account_id + '-' + role)
+                              response = STS.assume_role(RoleArn=role_arn, RoleSessionName=ses_name)
+                              sts_session = boto3.Session(
+                                  aws_access_key_id=response['Credentials']['AccessKeyId'],
+                                  aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+                                  aws_session_token=response['Credentials']['SessionToken'])
+                              return sts_session
+                      except botocore.exceptions.ClientError as exe:
+                          logging.error('Unable to assume role')
+                          raise exe
+                  
+                  sts_session = assume_role(account_id)
+                  logging.info(f'Printing STS session: {sts_session}')
+                  
+                  configservice = sts_session.client('config', region_name=aws_region)
+                  configrecorder = configservice.describe_configuration_recorders()
+                  logging.info(f'Existing Configuration Recorder: {configrecorder}')
+                  
+                  recorder_name = 'aws-controltower-BaselineConfigRecorder'
+                  if configrecorder and 'ConfigurationRecorders' in configrecorder and len(configrecorder['ConfigurationRecorders']) > 0:
+                      recorder_name = configrecorder['ConfigurationRecorders'][0]['name']
+                      logging.info(f'Using existing recorder name: {recorder_name}')
+                  
+                  try:
+                      role_arn = 'arn:aws:iam::' + account_id + ':role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig'
+                      
+                      # Get region-specific resources by looking up the current region in mappings
+                      # This ensures each region gets its specific configuration instead of home region config
+                      region_resource_types_mapping = json.loads(os.getenv('REGION_RESOURCE_TYPES_MAPPING', '{}'))
+                      region_exclusions_mapping = json.loads(os.getenv('REGION_EXCLUSIONS_MAPPING', '{}'))
+                      
+                      # Get region-specific resources for the current target region (not home region)
+                      region_continuous_resources = region_resource_types_mapping.get(aws_region, {}).get('ResourceTypes', [])
+                      region_exclusions = region_exclusions_mapping.get(aws_region, {}).get('ResourceTypes', [])
+                      
+                      logging.info(f'Region-specific continuous resources for {aws_region}: {region_continuous_resources}')
+                      logging.info(f'Region-specific exclusions for {aws_region}: {region_exclusions}')
+                      
+                      CONFIG_RECORDER_STRATEGY = os.getenv('CONFIG_RECORDER_STRATEGY', 'EXCLUSION')
+                      
+                      CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY = os.getenv('CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY')
+                      
+                      # Determine Control Tower home region
+                      home_region = os.getenv('CONTROL_TOWER_HOME_REGION') == aws_region
+                      
+                      # Use region-specific continuous resources
+                      all_continuous_resources = region_continuous_resources
+                      
+                      logging.info(f'Region: {aws_region}')
+                      logging.info(f'Home Region: {home_region}')
+                      logging.info(f'Region Continuous Resources: {region_continuous_resources}')
+                      logging.info(f'Region Exclusions: {region_exclusions}')
+                      logging.info(f'All Continuous Resources: {all_continuous_resources}')
+                      logging.info(f'Final Exclusion List: {region_exclusions}')
+                      
+                      if event == 'Delete':
+                          response = configservice.put_configuration_recorder(
+                              ConfigurationRecorder={
+                                  'name': recorder_name,
+                                  'roleARN': role_arn,
+                                  'recordingGroup': {
+                                      'allSupported': True,
+                                      'includeGlobalResourceTypes': home_region
+                                  }
+                              })
+                          logging.info(f'Response for put_configuration_recorder :{response} ')
+                      else:
+                          if CONFIG_RECORDER_STRATEGY == 'EXCLUSION':
+                              logging.info(f'Using EXCLUSION strategy')
+                              logging.info(f'Exclusion resource list: {region_exclusions}')
+                              logging.info(f'Continuous recording resources: {all_continuous_resources}')
+                              
+                              config_recorder = {
+                                  'name': recorder_name,
+                                  'roleARN': role_arn,
+                                  'recordingGroup': {
+                                      'allSupported': False,
+                                      'includeGlobalResourceTypes': False,
+                                      'exclusionByResourceTypes': {
+                                          'resourceTypes': region_exclusions
+                                      },
+                                      'recordingStrategy': {
+                                          'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'
+                                      }
+                                  },
+                                  'recordingMode': {
+                                      'recordingFrequency': CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY,
+                                      'recordingModeOverrides': [
+                                          {
+                                              'description': 'CONTINUOUS_OVERRIDE',
+                                              'resourceTypes': all_continuous_resources,
+                                              'recordingFrequency': 'CONTINUOUS'
+                                          }
+                                      ] if all_continuous_resources else []
+                                  }
+                              }
+                              
+                              if not region_exclusions:
+                                  config_recorder['recordingGroup'].pop('exclusionByResourceTypes')
+                                  config_recorder['recordingGroup'].pop('recordingStrategy')
+                                  config_recorder['recordingGroup']['allSupported'] = True
+                                  config_recorder['recordingGroup']['includeGlobalResourceTypes'] = home_region
+                          else:
+                              # Inclusion-based strategy - record all supported resources since no inclusion list is provided
+                              logging.info(f'Using INCLUSION strategy - recording all supported resources')
+                              logging.info(f'Continuous recording resources: {all_continuous_resources}')
+                              
+                              config_recorder = {
+                                  'name': recorder_name,
+                                  'roleARN': role_arn,
+                                  'recordingGroup': {
+                                      'allSupported': True,
+                                      'includeGlobalResourceTypes': home_region
+                                  },
+                                  'recordingMode': {
+                                      'recordingFrequency': CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY,
+                                      'recordingModeOverrides': [
+                                          {
+                                              'description': 'CONTINUOUS_OVERRIDE',
+                                              'resourceTypes': all_continuous_resources,
+                                              'recordingFrequency': 'CONTINUOUS'
+                                          }
+                                      ] if all_continuous_resources else []
+                                  }
+                              }
+                          
+                          response = configservice.put_configuration_recorder(ConfigurationRecorder=config_recorder)
+                          logging.info(f'Response for put_configuration_recorder :{response} ')
+                      
+                      # lets describe for configuration recorder after the update
+                      configrecorder = configservice.describe_configuration_recorders()
+                      logging.info(f'Post Change Configuration recorder : {configrecorder}')
+                      
+                  except botocore.exceptions.ClientError as exe:
+                      logging.error('Unable to Update Config Recorder for Account and Region : ', account_id, aws_region)
+                      configrecorder = configservice.describe_configuration_recorders()
+                      logging.info(f'Exception : {configrecorder}')
+                      raise exe
+                  
+                  return {'statusCode': 200}
+              
+              except Exception as e:
+                  exception_type = e.__class__.__name__
+                  exception_message = str(e)
+                  logging.exception(f'{exception_type}: {exception_message}')
+      Handler: index.lambda_handler
+      Role: !GetAtt ConsumerLambdaExecutionRole.Arn
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 180
+      Architectures:
+        - x86_64
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          CONFIG_RECORDER_STRATEGY: !Ref ConfigRecorderStrategy
+          CONFIG_RECORDER_DEFAULT_RECORDING_FREQUENCY: !Ref ConfigRecorderDefaultRecordingFrequency
+          CONTROL_TOWER_HOME_REGION: !Ref "AWS::Region"
+          REGION_RESOURCE_TYPES_MAPPING: !Sub
+            - |
+              {
+                "us-east-1": {
+                  "ResourceTypes": ["${UsEast1Resources}"]
+                },
+                "us-west-2": {
+                  "ResourceTypes": ["${UsWest2Resources}"]
+                },
+                "ap-south-1": {
+                  "ResourceTypes": ["${ApSouth1Resources}"]
+                },
+                "ap-northeast-2": {
+                  "ResourceTypes": ["${ApNortheast2Resources}"]
+                },
+                "eu-west-1": {
+                  "ResourceTypes": ["${EuWest1Resources}"]
+                }
+              }
+            - UsEast1Resources: !Join ['", "', !FindInMap [RegionResourceTypes, us-east-1, ResourceTypes]]
+              UsWest2Resources: !Join ['", "', !FindInMap [RegionResourceTypes, us-west-2, ResourceTypes]]
+              ApSouth1Resources: !Join ['", "', !FindInMap [RegionResourceTypes, ap-south-1, ResourceTypes]]
+              ApNortheast2Resources: !Join ['", "', !FindInMap [RegionResourceTypes, ap-northeast-2, ResourceTypes]]
+              EuWest1Resources: !Join ['", "', !FindInMap [RegionResourceTypes, eu-west-1, ResourceTypes]]
+          REGION_EXCLUSIONS_MAPPING: !Sub
+            - |
+              {
+                "us-east-1": {
+                  "ResourceTypes": ["${UsEast1Exclusions}"]
+                },
+                "us-west-2": {
+                  "ResourceTypes": ["${UsWest2Exclusions}"]
+                },
+                "ap-south-1": {
+                  "ResourceTypes": ["${ApSouth1Exclusions}"]
+                },
+                "ap-northeast-2": {
+                  "ResourceTypes": ["${ApNortheast2Exclusions}"]
+                },
+                "eu-west-1": {
+                  "ResourceTypes": ["${EuWest1Exclusions}"]
+                }
+              }
+            - UsEast1Exclusions: !Join ['", "', !FindInMap [RegionExclusions, us-east-1, ResourceTypes]]
+              UsWest2Exclusions: !Join ['", "', !FindInMap [RegionExclusions, us-west-2, ResourceTypes]]
+              ApSouth1Exclusions: !Join ['", "', !FindInMap [RegionExclusions, ap-south-1, ResourceTypes]]
+              ApNortheast2Exclusions: !Join ['", "', !FindInMap [RegionExclusions, ap-northeast-2, ResourceTypes]]
+              EuWest1Exclusions: !Join ['", "', !FindInMap [RegionExclusions, eu-west-1, ResourceTypes]]
+
+  ConsumerLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt SQSConfigRecorder.Arn
+      FunctionName: !GetAtt ConsumerLambda.Arn
+
+  ProducerLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: ct_cro_producer
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStackInstances
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:*:*:stackset/AWSControlTowerBP-BASELINE-CONFIG:*"
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SQSConfigRecorder.Arn
+
+  ConsumerLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: policy-sts-all
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SQSConfigRecorder.Arn
+
+  SQSConfigRecorder:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      DelaySeconds: 5
+      KmsMasterKeyId: alias/aws/sqs
+
+  ProducerLambdaTrigger:
+    Type: "Custom::ExecuteLambda"
+    Properties:
+      ServiceToken: !GetAtt "ProducerLambda.Arn"
+      FunctionName: !Ref ProducerLambda
+      Version: !Ref CloudFormationVersion
